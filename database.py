@@ -61,13 +61,13 @@ class Database:
 
   def establish_consistency(self):
     # starting from oldest entry
-    # find any gaps in data through present
+    # find and fill any gaps in data through present
     end_time = int(time.time())
 
   def __keep_current(self):
     self.keep_current = True
     signal.signal(signal.SIGALRM, self.__handler)
-    signal.setitimer(signal.ITIMER_REAL, 1e-5, self.granularity) # non zero init value required
+    signal.setitimer(signal.ITIMER_REAL, (60 - time.time() % 60) + 30, self.granularity) # non zero init value required
 
   @staticmethod
   def readable_datetime(time_to_convert):
@@ -132,7 +132,7 @@ class CoinBase:
           # missing candle, will try request one more time
           print(f"Error - {Database.readable_datetime(time_end - i * granularity)}\
                   candle is absent from requested range. Trying again...")
-          skip = !success
+          skip != success
           success = False 
           break
       if success or skip:
