@@ -122,7 +122,7 @@ class Database:
         print("Failed to fetch latest candle add_historic - empty GET response")
         return
       last = self.get_oldest()
-    candles, missing = self.cb.get_candles(last[0] - self.granularity, count, verbose=True)
+    candles, missing = self.cb.get_candles(last[0] - self.granularity, count, self.granularity, verbose=True)
     if len(candles) != 0:
       self.insert_many(candles)
     if len(missing) != 0:
@@ -136,6 +136,7 @@ class Database:
     print("\n...FINISHED\n")
 
   def write_to_csv(self):
+    print(f"Writing {self.name} to file...")
     filename = f"data_{int(time.time())}.csv"
     try:
       f = open(filename, "w")
@@ -145,6 +146,7 @@ class Database:
       f.close()
     except:
       print("Error: could not write to file")
+    print(f"...FINISHED\n")
 
   @staticmethod
   def readable_datetime(time_to_convert):
@@ -259,7 +261,7 @@ class CoinBase:
     while num_candles > 0:
       if verbose:
         sys.stdout.write("\x1b[0G" + \
-        f"  Candles still to request - {num_candles:>10}")
+        f"  Candles still to request - {num_candles:<10}")
         sys.stdout.flush()
       # coinbase api limit of 300 candles per request
       request_size = 300 if num_candles // 300 else num_candles 
@@ -307,10 +309,10 @@ if __name__ == "__main__":
     print(f"USAGE: python3 {sys.argv[0]} <db_name>")
     exit(1)
   db_name = sys.argv[1]
-  db = Database(db_name)
-  #db.add_historic(60*24*100)
-  db.write_to_csv()
+  db = Database(db_name, granularity=60)
+  #db.add_historic(12*24)
   #db.establish_consistency(verbose=True)
-  #db.keep_current()
+  #db.write_to_csv()
+  db.keep_current()
   while db.live:
     signal.pause()
