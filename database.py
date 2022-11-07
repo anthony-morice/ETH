@@ -194,7 +194,7 @@ class Database:
     if self.first_fetch and self.make_consistent:
       self.first_fetch = False
       status, failed = self.establish_consistency()
-      if not status:
+      if not status and len(failed) > 0:
         print("Error - Could not fill the following gaps:")
         for ts in failed:
           print(f"  {Database.readable_datetime(ts)}")
@@ -310,9 +310,11 @@ if __name__ == "__main__":
     exit(1)
   db_name = sys.argv[1]
   db = Database(db_name, granularity=60)
-  #db.add_historic(12*24)
-  #db.establish_consistency(verbose=True)
-  #db.write_to_csv()
+  '''
+  db.add_historic(60*24*30*6)
+  db.establish_consistency(verbose=True)
+  db.write_to_csv()
+  '''
   db.keep_current()
   while db.live:
     signal.pause()
