@@ -14,9 +14,9 @@ class Database:
     self.granularity = granularity
     self.cb = CoinBase()
     self.keys = self.cb.keys
-    self.keep_current = keep_current 
-    self.first_fetch = True
+    self.live = keep_current 
     self.make_consistent = make_consistent
+    print(f"Connecting to database {self.name}...")
     try:
       self.connection = sqlite3.connect(self.name)
     except:
@@ -26,14 +26,15 @@ class Database:
     qry = "CREATE TABLE IF NOT EXISTS Data (" +\
           ", ".join([key for key in self.keys]) + ")"
     self.cursor.execute(qry)
-    if self.make_consistent and not self.keep_current:
+    print("...SUCCESS\n")
+    if self.make_consistent and not self.live:
       status, failed = self.establish_consistency()
       if not status:
         print("Error - Could not fill the following gaps:")
         for ts in failed:
           print(f"  {Database.readable_datetime(ts)}")
-    if self.keep_current:
-      self.__keep_current()
+    if self.live:
+      self.keep_current(self.make_consistent)
   
   def insert(self, row):
     qry = "INSERT INTO Data VALUES(" + ", ".join(['?' for _ in self.keys]) + ")"
@@ -62,6 +63,114 @@ class Database:
   def query(self, qry):
     self.cursor.execute(qry)
   
+  def establish_consistency(self):
+    print(f"\n\nAttempting to make {self.name} consistent...")
+    missing = []
+    last = self.get_last()
+    if last is None: # empty database
+      return True, []
+    # remove any duplicates
+    print("  Removing any duplicates...")
+    self.cursor.execute(f"DELETE FROM Data WHERE rowid NOT IN (SELECT MIN(rowid) FROM Data GROUP BY {self.keys[0]})")
+    print("    DONE")
+    # find and fill any gaps in data
+    next_ts = last[0] - self.granularity
+    qry = self.cursor.execute(f"SELECT {self.keys[0]} FROM Data ORDER BY {self.keys[0]} DESC")
+    data = qry.fetchall()[1:]
+    count_missing = 0
+    for ts in data:
+      ts = ts[0] # unpack query tuple (ts,)
+      if ts != next_ts:
+        count = (next_ts - ts) // self.granularity
+        count_missing += count
+        missing += [(next_ts, count)]
+      next_ts = ts - self.granularity
+    # request missing data
+    print(f"  Requesting {count_missing} missing candles...")
+    status = True
+    failed = []
+    for (time_end, count) in missing:
+      candles, fail = self.cb.get_candles(time_end, count, self.granularity)
+      if len(fail) != 0:
+        status = False
+        failed += fail
+      if len(candles) != 0:
+        self.insert_many(candles)
+    if not status:
+      print(f"  {len(failed)} missing candles could not be retrieved") 
+    else:
+      print("    SUCCESS")
+    print("...FINISHED\n")
+    return status, failed
+
+  def add_historic(self, count):
+    # should not be called when self.live == True
+    # so as to avoid potential race conditions
+    if self.live:
+      print("Error - add_historic should not be called when live == True")
+      return
+    print(f"Adding {count} candles of historical data...")
+    # add count historic candles before oldest entry
+    last = self.get_oldest()
+    if last is None:
+      entry, _ = self.cb.get_candles(int(time.time()) - int(time.time()) % 60 - 60, granularity=self.granularity)
+      if len(entry) != 0:
+        self.insert_many(entry)
+      else:
+        print("Failed to fetch latest candle add_historic - empty GET response")
+        return
+      last = self.get_oldest()
+    candles, missing = self.cb.get_candles(last[0] - self.granularity, count, verbose=True)
+    if len(candles) != 0:
+      self.insert_many(candles)
+    if len(missing) != 0:
+      print("Error - the following historic timestamps could not be retrieved:")
+      for ts in missing:
+        print(f"  {Database.readable_datetime(ts)}")
+    print("\n...FINISHED\n")
+
+  def write_to_csv(self):
+    filename = f"data_{int(time.time())}.csv"
+    try:
+      f = open(filename, "w")
+      f.write(f"{','.join(self.keys)}\n")
+      for row in self.get_all():
+        f.write(",".join(list(map(lambda x: str(x), row))) + "\n")
+      f.close()
+    except:
+      print("Error: could not write to file")
+
+  @staticmethod
+  def readable_datetime(time_to_convert):
+    return time.asctime(time.localtime(time_to_convert))
+
+  def keep_current(self, make_consistent=True):
+    print(f"{self.name} will now be updated every {self.granularity} seconds")
+    self.live, self.first_fetch, self.make_consistent = True, True, make_consistent
+    signal.signal(signal.SIGALRM, self.__handler)
+    last = self.get_last()
+    if last is None: # empty database
+      # use next minute aligned timestamp as starting point
+      if time.time() % 60 < REQUEST_OFFSET:
+        wait = -(time.time() % 60)
+      else:
+        wait = (60 - time.time() % 60)
+    else:
+      # determine wait time to keep database timestamp alignment consistent
+      # given the existing entries and granularity
+      current = int(time.time())
+      n = (current - last[0]) // self.granularity
+      next_ts = last[0] + self.granularity * n
+      wait = next_ts - current
+      if wait < -REQUEST_OFFSET:
+        wait += self.granularity
+    # note the offset from minute aligned request time
+    # this is to avoid empty GET responses from coinbase
+    # also, timer cannot be initialized with 0 hence max (..., 1e-5)
+    wait = max(wait + REQUEST_OFFSET, 1e-5)
+    print(f"First update scheduled for {Database.readable_datetime(time.time() + wait)}")
+    signal.setitimer(signal.ITIMER_REAL, wait, self.granularity)
+
   def __handler(self, signum, frame):
     self.__fetch_latest()
 
@@ -81,92 +190,6 @@ class Database:
         print("Error - Could not fill the following gaps:")
         for ts in failed:
           print(f"  {Database.readable_datetime(ts)}")
-
-  def establish_consistency(self):
-    print(f"Attempting to make {self.name} consistent...")
-    # find and fill any gaps in data
-    missing = []
-    last = self.get_last()
-    if last is None:
-      return True, []
-    trail_ts, next_ts = last[0], last[0] - self.granularity
-    qry = self.cursor.execute(f"SELECT {self.keys[0]} FROM Data ORDER BY {self.keys[0]} DESC")
-    data = qry.fetchall()[1:]
-    for ts in data:
-      ts = ts[0]
-      if ts != next_ts:
-        count = (trail_ts - ts) // self.granularity - 1
-        missing += [(next_ts, count)]
-        trail_ts = ts
-        next_ts = ts - self.granularity
-    # request missing data
-    status = True
-    failed = []
-    breakpoint()
-    for (time_end, count) in missing:
-      candles, fail = self.cb.get_candles(time_end, count, self.granularity)
-      if len(fail) != 0:
-        status = False
-        failed += fail
-      if len(candles) != 0:
-        self.insert_many(candles)
-    print("...DONE")
-    return status, failed
-
-  def __keep_current(self):
-    self.keep_current, self.first_fetch = True, True
-    signal.signal(signal.SIGALRM, self.__handler)
-    last = self.get_last()
-    if last is None: # empty database
-      # use next minute aligned timestamp as starting point
-      if time.time() % 60 < REQUEST_OFFSET:
-        wait = -(time.time() % 60) + 1e-5
-      else:
-        wait = (60 - time.time() % 60)
-    else:
-      # determine wait time to keep database timestamp alignment consistent
-      # given the existing entries and granularity
-      current = int(time.time())
-      n = (current - last[0]) // self.granularity + 1
-      next_ts = last[0] + self.granularity * n
-      wait = next_ts - current
-    # note the offset from minute aligned request time
-    # this is to avoid empty GET responses from coinbase
-    signal.setitimer(signal.ITIMER_REAL, wait + REQUEST_OFFSET, self.granularity)
-
-  def add_historic(self, count):
-    # add count historic candles before oldest entry
-    last = self.get_oldest()
-    if last is None:
-      entry, _ = self.cb.get_candles(int(time.time()) - int(time.time()) % 60 - 60, granularity=self.granularity)
-      if len(entry) != 0:
-        self.insert_many(entry)
-      else:
-        print("Failed to fetch latest candle add_historic - empty GET response")
-        return
-      last = self.get_oldest()
-    candles, missing = self.cb.request_candles(last[0] - self.granularity, count)
-    if len(candles) != 0:
-      self.insert_many(candles)
-    if len(missing) != count:
-      print("Error - the following historic timestamps could not be retrieved:")
-      for ts in missing:
-        print(f"  {Database.readable_datetime(ts)}")
-
-  def write_to_csv(self):
-    filename = f"data_{int(time.time())}.csv"
-    try:
-      f = open(filename, "w")
-      f.write(f"{','.join(self.keys)}\n")
-      for row in self.get_all():
-        f.write(",".join(list(map(lambda x: str(x), row))) + "\n")
-      f.close()
-    except:
-      print("Error: could not write to file")
-
-  @staticmethod
-  def readable_datetime(time_to_convert):
-    return time.asctime(time.localtime(time_to_convert))
 
 class CoinBase:
   def __init__(self, product_id = "ETH-USD"):
@@ -205,7 +228,7 @@ class CoinBase:
         candles = []
     return candles
 
-  def get_candles(self, time_end, num_candles = 1, granularity = 60):
+  def get_candles(self, time_end, num_candles = 1, granularity = 60, verbose=False):
     """
     @param time_end - of the form seconds since the epoch in UTC (i.e. time.time())
 
@@ -222,6 +245,10 @@ class CoinBase:
     missing = []
     success, skip = True, False
     while num_candles > 0:
+      if verbose and num_candles % 1000:
+        sys.stdout.write("\x1b[0G" + \
+        f"  Candles still to request - {num_candles}")
+        sys.stdout.flush()
       # coinbase api limit of 300 candles per request
       request_size = 300 if num_candles // 300 else num_candles 
       request_candles = self.__get_candles(time_end, request_size, granularity)
@@ -256,9 +283,8 @@ if __name__ == "__main__":
     print(f"USAGE: python3 {sys.argv[0]} <db_name>")
     exit(1)
   db_name = sys.argv[1]
-  #db = Database(db_name)
-  db = Database(db_name, make_consistent=True)
-  db.write_to_csv()
-  #db = Database(db_name, keep_current=True)
-  while db.keep_current:
+  db = Database(db_name)
+  db.add_historic(60*24)
+  db.keep_current()
+  while db.live:
     signal.pause()
