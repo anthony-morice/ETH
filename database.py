@@ -63,7 +63,7 @@ class Database:
   def query(self, qry):
     self.cursor.execute(qry)
   
-  def establish_consistency(self):
+  def establish_consistency(self, verbose=False):
     print(f"\n\nAttempting to make {self.name} consistent...")
     missing = []
     last = self.get_last()
@@ -86,18 +86,20 @@ class Database:
         missing += [(next_ts, count)]
       next_ts = ts - self.granularity
     # request missing data
-    print(f"  Requesting {count_missing} missing candles...")
+    print(f"  Requesting {count_missing} missing candles in {len(missing)} different requests...")
+    if verbose:
+      print(missing)
     status = True
     failed = []
     for (time_end, count) in missing:
       candles, fail = self.cb.get_candles(time_end, count, self.granularity)
-      if len(fail) != 0:
+      if len(candles) != count:
         status = False
         failed += fail
       if len(candles) != 0:
         self.insert_many(candles)
     if not status:
-      print(f"  {len(failed)} missing candles could not be retrieved") 
+      print(f"At least {len(candles)} missing candles could not be retrieved") 
     else:
       print("    SUCCESS")
     print("...FINISHED\n")
@@ -124,9 +126,13 @@ class Database:
     if len(candles) != 0:
       self.insert_many(candles)
     if len(missing) != 0:
+      print("\nError - some historic timestamps could not be retrieved:")
+    '''
+    if len(missing) != 0:
       print("Error - the following historic timestamps could not be retrieved:")
       for ts in missing:
         print(f"  {Database.readable_datetime(ts)}")
+    '''
     print("\n...FINISHED\n")
 
   def write_to_csv(self):
@@ -215,16 +221,22 @@ class CoinBase:
                    "&start=", time_start, "&end=", time_end))
     headers = {"Accept": "application/json"}
     try:
-      response = requests.request("GET", url, headers=headers)
+      response = requests.request("GET", url, headers=headers, timeout=1)
+    except requests.exceptions.Timeout:
+      print(f"\nError - GET request timeout")
     except:
-      print(f"Error - GET request failed: {response.text}")
+      print(f"\nError - GET request failed")
     else:
       try:
-        candles = response.text.split("],[")
-        for i, candle in enumerate(candles):
-          candles[i] = list(map(lambda x: float(x), candle.strip("[]").split(",")))
+        if response.text == '[]':
+          print(f"\nError - empty GET response")
+          candles = []
+        else:
+          candles = response.text.split("],[")
+          for i, candle in enumerate(candles):
+            candles[i] = list(map(lambda x: float(x), candle.strip("[]").split(",")))
       except:
-        print(f"Error - could not parse GET response: {candles}")
+        print(f"\nError - could not parse GET response: {candles}")
         candles = []
     return candles
 
@@ -243,38 +255,50 @@ class CoinBase:
     time_end -= time_end % 60 # used to sync time_end with database intervals
     candles = []
     missing = []
-    success, skip = True, False
+    success, skip, timeout = True, False, False
     while num_candles > 0:
-      if verbose and num_candles % 1000:
+      if verbose:
         sys.stdout.write("\x1b[0G" + \
-        f"  Candles still to request - {num_candles}")
+        f"  Candles still to request - {num_candles:>10}")
         sys.stdout.flush()
       # coinbase api limit of 300 candles per request
       request_size = 300 if num_candles // 300 else num_candles 
       request_candles = self.__get_candles(time_end, request_size, granularity)
       # ensure all requested candles were recieved
-      for i, candle in enumerate(request_candles):
-        if int(candle[0]) != time_end - i * granularity:
-          # missing candle, will try request one more time
-          timestamp = time_end - i * granularity
-          print(f"Error - {Database.readable_datetime(timestamp)}\
-                  candle is absent from requested range. Trying again...")
-          skip != success
-          if not success: 
-            # already failed once so figure out which candles are missing and move on
-            missing += timestamp
-            continue
-          success = False 
+      if len(request_candles) == 0:
+        if not timeout:
+          timeout = True
+          print(f"\nError - no candles were recieved. Trying again...")
+          continue
+        else:
+          print(f"\nError - no candles were recieved. Abandonning request")
           break
+      else:
+        single_success = True
+        for i, candle in enumerate(request_candles):
+          timeout = False
+          if int(candle[0]) != time_end - i * granularity:
+            single_success = False
+            # missing candle, will try request one more time
+            timestamp = time_end - i * granularity
+            skip = not success
+            if not success: 
+              # already failed once so figure out which candles are missing and move on
+              missing += [timestamp]
+              continue
+            print(f"\nError - {Database.readable_datetime(timestamp)} is absent from requested range. Trying again...")
+            success = False
+            break
+        if single_success:
+          success = True
       if success or skip:
         success, skip = True, False
         candles += request_candles
         missed = request_size - len(request_candles)
-        if len(request_candles) > 0:
-          time_end = request_candles[-1][0] - granularity
-          num_candles -= len(request_candles)
+        time_end = request_candles[-1][0] - granularity
+        num_candles -= len(request_candles)
         if missed != 0:
-          print(f"Error - did not receive {missed} candles. Continuing without them...")
+          print(f"\nError - did not receive {missed} candles. Continuing without them...")
           num_candles -= missed
     return candles, missing
 
@@ -284,7 +308,9 @@ if __name__ == "__main__":
     exit(1)
   db_name = sys.argv[1]
   db = Database(db_name)
-  db.add_historic(60*24)
-  db.keep_current()
+  #db.add_historic(60*24*100)
+  db.write_to_csv()
+  #db.establish_consistency(verbose=True)
+  #db.keep_current()
   while db.live:
     signal.pause()
